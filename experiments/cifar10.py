@@ -1,5 +1,6 @@
 import numpy as np
 import csv  # For saving results
+import os
 
 from absl import app
 from absl import flags
@@ -18,20 +19,19 @@ NUM_CLASSES = 10
 WIDTH = 32
 HEIGHT = 32
 CHANNELS = 3
-SHADOW_DATASET_SIZE = 300  # Adjusted to 300 per shadow model (in/out sets)
 ATTACK_TEST_DATASET_SIZE = 2500
 
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer(
-    "target_epochs", 100, "Number of epochs to train target and shadow models."
+    "target_epochs", 100, "Max number of epochs to train target and shadow models."
 )
-flags.DEFINE_integer("attack_epochs", 100, "Number of epochs to train attack models.")
+flags.DEFINE_integer("attack_epochs", 100, "Max number of epochs to train attack models.")
 flags.DEFINE_integer("num_shadows", 100, "Number of shadow models to train.")
 
 
 def get_data(dataset_size):
-    """Prepare CIFAR10 data with specific splitting strategy.
+    """Prepare CIFAR10 data.
     
     Args:
         dataset_size (int): Number of samples for target training and testing.
@@ -72,9 +72,7 @@ def get_data(dataset_size):
 
 
 def target_model_fn():
-    """The architecture of the target (victim) model.
-
-    The attack is white-box, hence the attacker is assumed to know this architecture too."""
+    """The architecture of the target (victim) model. Made to paper specifications."""
 
     model = tf.keras.models.Sequential()
 
@@ -136,9 +134,16 @@ def attack_model_fn():
 def demo(argv):
     del argv  # Unused.
 
-    # Define dataset sizes
+    # Define dataset sizes and callbacks
     dataset_sizes = [2500, 5000, 10000, 15000]
     runs_per_size = 10
+    
+    # Define early stopping callback
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        patience=5,
+        restore_best_weights=True
+    )
 
     # Initialize list to collect results
     results = []
@@ -149,6 +154,10 @@ def demo(argv):
     # Loop over each dataset size
     for size in dataset_sizes:
         print(f"\n=== Running experiments for target training size: {size} ===")
+        
+        # Set shadow dataset size equal to target model training size
+        shadow_dataset_size = size
+        
         for run in range(1, runs_per_size + 1):
             print(f"\n--- Run {run}/{runs_per_size} for size {size} ---")
 
@@ -167,13 +176,14 @@ def demo(argv):
                 X_train, y_train,
                 epochs=FLAGS.target_epochs,
                 validation_data=(X_test, y_test),
-                verbose=0  # Set to 0 for less verbosity
+                callbacks=[early_stopping],
+                verbose=0
             )
 
-            # Train the shadow models
+            # Train the shadow models with matching dataset size
             smb = ShadowModelBundle(
                 model_fn=target_model_fn,
-                shadow_dataset_size=SHADOW_DATASET_SIZE,
+                shadow_dataset_size=shadow_dataset_size,
                 num_models=FLAGS.num_shadows,
             )
 
@@ -183,6 +193,7 @@ def demo(argv):
                 y_shadow,
                 fit_kwargs=dict(
                     epochs=FLAGS.target_epochs,
+                    callbacks=[early_stopping],
                     verbose=0
                 ),
             )
@@ -196,6 +207,7 @@ def demo(argv):
                 X_attack, y_attack,
                 fit_kwargs=dict(
                     epochs=FLAGS.attack_epochs,
+                    callbacks=[early_stopping],
                     verbose=0
                 )
             )
@@ -231,7 +243,10 @@ def demo(argv):
             })
 
     # Save the results to a CSV file
-    csv_file = "membership_inference_attack_results.csv"
+    results_dir = "results"
+    os.makedirs(results_dir, exist_ok=True)
+    csv_file = os.path.join(results_dir, "membership_inference_attack_results.csv")
+    
     with open(csv_file, mode='w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=["dataset_size", "run", "precision", "recall", "accuracy"])
         writer.writeheader()
