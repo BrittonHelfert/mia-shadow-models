@@ -15,7 +15,7 @@ NUM_CLASSES = 10
 WIDTH = 32
 HEIGHT = 32
 CHANNELS = 3
-SHADOW_DATASET_SIZE = 4000
+SHADOW_DATASET_SIZE = 45000
 ATTACK_TEST_DATASET_SIZE = 2500
 
 
@@ -28,17 +28,37 @@ flags.DEFINE_integer("num_shadows", 100, "Number of epochs to train attack model
 
 
 def get_data():
-    """Prepare CIFAR10 data."""
-    (X_train, y_train), (X_test, y_test) = tf.keras.datasets.cifar10.load_data()
-    y_train = tf.keras.utils.to_categorical(y_train)
-    y_test = tf.keras.utils.to_categorical(y_test)
-    X_train = X_train.astype("float32")
-    X_test = X_test.astype("float32")
-    y_train = y_train.astype("float32")
-    y_test = y_test.astype("float32")
-    X_train /= 255
-    X_test /= 255
-    return (X_train, y_train), (X_test, y_test)
+    """Prepare CIFAR10 data with specific splitting strategy."""
+    (X_train_full, y_train_full), (X_test_full, y_test_full) = tf.keras.datasets.cifar10.load_data()
+    
+    # Combine all data
+    X_full = np.concatenate([X_train_full, X_test_full])
+    y_full = np.concatenate([y_train_full, y_test_full])
+    
+    # Convert to float and normalize
+    X_full = X_full.astype("float32") / 255.0
+    y_full = tf.keras.utils.to_categorical(y_full)
+    
+    # Set aside equal sized train/test sets for target model
+    target_size = ATTACK_TEST_DATASET_SIZE * 2  # Equal train and test sizes
+    indices = np.arange(len(X_full))
+    target_indices = np.random.choice(indices, target_size, replace=False)
+    shadow_indices = np.setdiff1d(indices, target_indices)
+    
+    # Split target data into train/test
+    target_train_indices = target_indices[:ATTACK_TEST_DATASET_SIZE]
+    target_test_indices = target_indices[ATTACK_TEST_DATASET_SIZE:]
+    
+    X_target_train = X_full[target_train_indices]
+    y_target_train = y_full[target_train_indices]
+    X_target_test = X_full[target_test_indices]
+    y_target_test = y_full[target_test_indices]
+    
+    # Remaining data for shadow models
+    X_shadow = X_full[shadow_indices]
+    y_shadow = y_full[shadow_indices]
+    
+    return (X_target_train, y_target_train), (X_target_test, y_target_test), (X_shadow, y_shadow)
 
 
 def target_model_fn():
@@ -84,7 +104,6 @@ def target_model_fn():
 
 def attack_model_fn():
     """Attack model that takes target model predictions and predicts membership.
-
     Following the original paper, this attack model is specific to the class of the input.
     Architecture: Single hidden layer (64 units) with ReLU activation and softmax output.
     """
@@ -93,12 +112,12 @@ def attack_model_fn():
     # Single hidden layer with 64 units and ReLU activation
     model.add(layers.Dense(64, activation="relu", input_shape=(NUM_CLASSES,)))
 
-    # Output layer with softmax activation (2 units for binary classification)
+    # Output layer with softmax activation
     model.add(layers.Dense(2, activation="softmax"))
 
     model.compile(
         optimizer="adam",
-        loss="categorical_crossentropy",  # Changed from binary_crossentropy due to softmax
+        loss="categorical_crossentropy",
         metrics=["accuracy"]
     )
     return model
@@ -107,36 +126,30 @@ def attack_model_fn():
 def demo(argv):
     del argv  # Unused.
 
-    (X_train, y_train), (X_test, y_test) = get_data()
+    # Get split data
+    (X_train, y_train), (X_test, y_test), (X_shadow, y_shadow) = get_data()
 
-    # Train the target model.
+    # Train the target model
     print("Training the target model...")
     target_model = target_model_fn()
     target_model.fit(
-        X_train, y_train, epochs=FLAGS.target_epochs, validation_split=0.1, verbose=True
+        X_train, y_train, epochs=FLAGS.target_epochs, validation_data=(X_test, y_test), verbose=True
     )
 
-    # Train the shadow models.
+    # Train the shadow models
     smb = ShadowModelBundle(
         target_model_fn,
         shadow_dataset_size=SHADOW_DATASET_SIZE,
         num_models=FLAGS.num_shadows,
     )
 
-    # We assume that attacker's data were not seen in target's training.
-    attacker_X_train, attacker_X_test, attacker_y_train, attacker_y_test = train_test_split(
-        X_test, y_test, test_size=0.1
-    )
-    print(attacker_X_train.shape, attacker_X_test.shape)
-
     print("Training the shadow models...")
-    X_shadow, y_shadow = smb.fit_transform(
-        attacker_X_train,
-        attacker_y_train,
+    X_attack, y_attack = smb.fit_transform(
+        X_shadow,
+        y_shadow,
         fit_kwargs=dict(
             epochs=FLAGS.target_epochs,
-            verbose=True,
-            validation_data=(attacker_X_test, attacker_y_test),
+            verbose=True
         ),
     )
 
@@ -146,7 +159,7 @@ def demo(argv):
     # Fit the attack models.
     print("Training the attack models...")
     amb.fit(
-        X_shadow, y_shadow, fit_kwargs=dict(epochs=FLAGS.attack_epochs, verbose=True)
+        X_attack, y_attack, fit_kwargs=dict(epochs=FLAGS.attack_epochs, verbose=True)
     )
 
     # Test the success of the attack.

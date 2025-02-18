@@ -72,24 +72,15 @@ class ShadowModelBundle(sklearn.base.BaseEstimator):
         return model
 
     def _fit(self, X, y, verbose=False, pseudo=False, fit_kwargs=None):
-        """Train the shadow models.
-
-        .. note::
-        Be careful not to hold out some of the passed data for validation
-        (e.g., if using Keras, passing `fit_kwargs=dict(validation_split=0.7)`).
-        Such data will be incorrectly marked as "used in training", whereas
-        it was not.
-
-        :param X: Data coming from the same distribution as the target
-                  training data
-        :param y: Data labels
-        :param bool verbose: Whether to display the progressbar
-        :param bool pseudo: If True, does not fit the models
-        :param dict fit_kwargs: Arguments that will be passed to the fit call for
-                each shadow model.
+        """Train the shadow models with overlapping but disjoint in/out sets.
+        
+        Each shadow model gets:
+        - An 'in' set that it trains on (members)
+        - An 'out' set it never sees (non-members)
+        Sets are disjoint within each model but can overlap between different models.
         """
-        self.shadow_train_indices_ = []
-        self.shadow_test_indices_ = []
+        self.shadow_in_indices_ = []  # Previously shadow_train_indices_
+        self.shadow_out_indices_ = [] # Previously shadow_test_indices_
 
         if self.serializer is None:
             self.shadow_models_ = []
@@ -98,22 +89,25 @@ class ShadowModelBundle(sklearn.base.BaseEstimator):
         indices = np.arange(X.shape[0])
 
         for i in self._get_model_iterator(verbose=verbose):
-            # Pick indices for this shadow model.
-            shadow_indices = self._prng.choice(
-                indices, 2 * self.shadow_dataset_size, replace=False
-            )
-            train_indices = shadow_indices[: self.shadow_dataset_size]
-            test_indices = shadow_indices[self.shadow_dataset_size :]
-            X_train, y_train = X[train_indices], y[train_indices]
-            self.shadow_train_indices_.append(train_indices)
-            self.shadow_test_indices_.append(test_indices)
+            # For each shadow model, randomly sample equal sized in/out sets
+            # Sets are disjoint within each model but can overlap between models
+            total_size = self.shadow_dataset_size * 2  # Size needed for in+out sets
+            shadow_indices = self._prng.choice(indices, total_size, replace=False)
+            
+            # Split into equal sized in/out sets
+            in_indices = shadow_indices[:self.shadow_dataset_size]  # Members
+            out_indices = shadow_indices[self.shadow_dataset_size:] # Non-members
+            
+            X_in, y_in = X[in_indices], y[in_indices]
+            self.shadow_in_indices_.append(in_indices)
+            self.shadow_out_indices_.append(out_indices)
 
             if pseudo:
                 continue
 
-            # Train the shadow model.
+            # Train the shadow model only on the 'in' set
             shadow_model = self.model_fn()
-            shadow_model.fit(X_train, y_train, **fit_kwargs)
+            shadow_model.fit(X_in, y_in, **fit_kwargs)
             if self.serializer is not None:
                 self.serializer.save(ShadowModelBundle.MODEL_ID_FMT % i, shadow_model)
             else:
@@ -143,8 +137,8 @@ class ShadowModelBundle(sklearn.base.BaseEstimator):
 
         for i in model_index_iter:
             shadow_model = self._get_model(i)
-            train_indices = self.shadow_train_indices_[i]
-            test_indices = self.shadow_test_indices_[i]
+            train_indices = self.shadow_in_indices_[i]
+            test_indices = self.shadow_out_indices_[i]
 
             train_data = self.X_fit_[train_indices], self.y_fit_[train_indices]
             test_data = self.X_fit_[test_indices], self.y_fit_[test_indices]
