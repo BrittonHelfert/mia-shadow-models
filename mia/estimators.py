@@ -160,28 +160,31 @@ class ShadowModelBundle(sklearn.base.BaseEstimator):
         return X_transformed, y_transformed
 
 
-def prepare_attack_data(model, data_in, data_out):
+def prepare_attack_data(target_model, data_in, data_out):
+    """Prepare training data for the attack model.
+
+    :param target_model: Model to attack
+    :param data_in: Examples that were used to train the target
+    :param data_out: Examples that were not used to train the target
+    :returns: (attack_features, attack_labels)
     """
-    Prepare the data in the attack model format.
+    # Compute predictions on in/out examples.
+    in_predictions = target_model.predict(data_in[0])
+    out_predictions = target_model.predict(data_out[0])
 
-    :param model: Classifier
-    :param (X, y) data_in: Data used for training
-    :param (X, y) data_out: Data not used for training
+    # Create features for attack model.
+    features_in = np.concatenate([in_predictions, data_in[1]], axis=1)
+    features_out = np.concatenate([out_predictions, data_out[1]], axis=1)
+    attack_features = np.concatenate([features_in, features_out], axis=0)
 
-    :returns: (X, y) for the attack classifier
-    """
-    X_in, y_in = data_in
-    X_out, y_out = data_out
-    y_hat_in = model.predict_proba(X_in)
-    y_hat_out = model.predict_proba(X_out)
+    # Create labels for attack model (one-hot encoded)
+    attack_labels_in = np.zeros((len(data_in[0]), 2))
+    attack_labels_in[:, 1] = 1  # [0,1] for members
+    attack_labels_out = np.zeros((len(data_out[0]), 2))
+    attack_labels_out[:, 0] = 1  # [1,0] for non-members
+    attack_labels = np.concatenate([attack_labels_in, attack_labels_out], axis=0)
 
-    labels = np.ones(y_in.shape[0])
-    labels = np.hstack([labels, np.zeros(y_out.shape[0])])
-    # TODO: this does not work for non-one-hot labels.
-    # data = np.hstack([y_hat_in, y_in])
-    data = np.c_[y_hat_in, y_in]
-    data = np.vstack([data, np.c_[y_hat_out, y_out]])
-    return data, labels
+    return attack_features, attack_labels
 
 
 class AttackModelBundle(sklearn.base.BaseEstimator):
@@ -197,7 +200,7 @@ class AttackModelBundle(sklearn.base.BaseEstimator):
             class labels.
     """
 
-    MODEL_ID_FMT = "attack_%d"
+    MODEL_ID_FMT = "attack_model_%d"
 
     def __init__(
         self, model_fn, num_classes, serializer=None, class_one_hot_coded=True
@@ -210,12 +213,10 @@ class AttackModelBundle(sklearn.base.BaseEstimator):
     def fit(self, X, y, verbose=False, fit_kwargs=None):
         """Train the attack models.
 
-        :param X: Shadow predictions coming from
-                  :py:func:`ShadowBundle.fit_transform`.
-        :param y: Ditto
+        :param X: Shadow predictions from ShadowBundle.fit_transform
+        :param y: One-hot encoded labels indicating membership
         :param verbose: Whether to display the progressbar
-        :param fit_kwargs: Arguments that will be passed to the fit call for
-                each attack model.
+        :param fit_kwargs: Arguments passed to model.fit
         """
         X_total = X[:, : self.num_classes]
         classes = X[:, self.num_classes :]
@@ -255,10 +256,16 @@ class AttackModelBundle(sklearn.base.BaseEstimator):
             model = self.attack_models_[model_index]
         return model
 
+    def predict(self, X):
+        """Predict membership (0/1) for given examples."""
+        probs = self.predict_proba(X)
+        return np.argmax(probs, axis=1)  # Return class with highest probability
+
     def predict_proba(self, X):
+        """Predict membership probabilities for given examples."""
         result = np.zeros((X.shape[0], 2))
-        shadow_preds = X[:, : self.num_classes]
-        classes = X[:, self.num_classes :]
+        shadow_preds = X[:, :self.num_classes]
+        classes = X[:, self.num_classes:]
 
         data_indices = np.arange(shadow_preds.shape[0])
         for i in range(self.num_classes):
@@ -270,12 +277,6 @@ class AttackModelBundle(sklearn.base.BaseEstimator):
 
             membership_preds = model.predict(shadow_preds[class_indices])
             for j, example_index in enumerate(class_indices):
-                prob = np.squeeze(membership_preds[j])
-                result[example_index, 1] = prob
-                result[example_index, 0] = 1 - prob
+                result[example_index] = membership_preds[j]
 
         return result
-
-    def predict(self, X):
-        probs = self.predict_proba(X)[:, 1]
-        return probs > 0.5

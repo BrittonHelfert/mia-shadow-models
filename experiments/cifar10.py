@@ -1,6 +1,3 @@
-"""
-Example membership inference attack against a deep net classifier on the CIFAR10 dataset
-"""
 import numpy as np
 
 from absl import app
@@ -19,15 +16,15 @@ WIDTH = 32
 HEIGHT = 32
 CHANNELS = 3
 SHADOW_DATASET_SIZE = 4000
-ATTACK_TEST_DATASET_SIZE = 4000
+ATTACK_TEST_DATASET_SIZE = 2500
 
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer(
-    "target_epochs", 12, "Number of epochs to train target and shadow models."
+    "target_epochs", 100, "Number of epochs to train target and shadow models."
 )
 flags.DEFINE_integer("attack_epochs", 12, "Number of epochs to train attack models.")
-flags.DEFINE_integer("num_shadows", 3, "Number of epochs to train attack models.")
+flags.DEFINE_integer("num_shadows", 100, "Number of epochs to train attack models.")
 
 
 def get_data():
@@ -55,27 +52,32 @@ def target_model_fn():
         layers.Conv2D(
             32,
             (3, 3),
-            activation="relu",
+            activation="tanh",
             padding="same",
             input_shape=(WIDTH, HEIGHT, CHANNELS),
         )
     )
-    model.add(layers.Conv2D(32, (3, 3), activation="relu"))
     model.add(layers.MaxPooling2D(pool_size=(2, 2)))
-    model.add(layers.Dropout(0.25))
 
-    model.add(layers.Conv2D(64, (3, 3), activation="relu", padding="same"))
-    model.add(layers.Conv2D(64, (3, 3), activation="relu"))
+    model.add(layers.Conv2D(64, (3, 3), activation="tanh", padding="same"))
     model.add(layers.MaxPooling2D(pool_size=(2, 2)))
-    model.add(layers.Dropout(0.25))
 
     model.add(layers.Flatten())
 
-    model.add(layers.Dense(512, activation="relu"))
-    model.add(layers.Dropout(0.5))
+    model.add(layers.Dense(128, activation="tanh"))
 
     model.add(layers.Dense(NUM_CLASSES, activation="softmax"))
-    model.compile("adam", loss="categorical_crossentropy", metrics=["accuracy"])
+
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=0.001,
+        decay=1e-7
+    )
+
+    model.compile(
+        optimizer=optimizer,
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
 
     return model
 
@@ -84,19 +86,21 @@ def attack_model_fn():
     """Attack model that takes target model predictions and predicts membership.
 
     Following the original paper, this attack model is specific to the class of the input.
-    AttachModelBundle creates multiple instances of this model for each class.
+    Architecture: Single hidden layer (64 units) with ReLU activation and softmax output.
     """
     model = tf.keras.models.Sequential()
 
-    model.add(layers.Dense(128, activation="relu", input_shape=(NUM_CLASSES,)))
+    # Single hidden layer with 64 units and ReLU activation
+    model.add(layers.Dense(64, activation="relu", input_shape=(NUM_CLASSES,)))
 
-    model.add(layers.Dropout(0.3, noise_shape=None, seed=None))
-    model.add(layers.Dense(64, activation="relu"))
-    model.add(layers.Dropout(0.2, noise_shape=None, seed=None))
-    model.add(layers.Dense(64, activation="relu"))
+    # Output layer with softmax activation (2 units for binary classification)
+    model.add(layers.Dense(2, activation="softmax"))
 
-    model.add(layers.Dense(1, activation="sigmoid"))
-    model.compile("adam", loss="binary_crossentropy", metrics=["accuracy"])
+    model.compile(
+        optimizer="adam",
+        loss="categorical_crossentropy",  # Changed from binary_crossentropy due to softmax
+        metrics=["accuracy"]
+    )
     return model
 
 
