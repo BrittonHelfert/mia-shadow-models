@@ -1,0 +1,5 @@
+numpy
+tensorflow-gpu
+scikit-learn
+absl-py
+tqdm 

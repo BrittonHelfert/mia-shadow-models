@@ -1,11 +1,19 @@
-import numpy as np
-import csv  # For saving results
 import os
+import numpy as np
+import csv
+import logging
+import tensorflow as tf
+import time
+
+# Suppress TensorFlow warnings
+tf.get_logger().setLevel(logging.ERROR)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import csv  # For saving results
 
 from absl import app
 from absl import flags
 
-import tensorflow as tf
 from tensorflow.keras import layers
 
 from sklearn.model_selection import train_test_split
@@ -14,10 +22,28 @@ from mia.estimators import ShadowModelBundle, AttackModelBundle, prepare_attack_
 
 from sklearn.metrics import precision_score, recall_score, accuracy_score
 
-# Add these near the top of the file, after imports
-USER = os.getenv('USER')
-BASE_DIR = f"/data/{USER}/mia_project"
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# Directory setup
+def get_base_dir():
+    """Get the base directory for data and results.
+    
+    Returns different paths for server vs local development:
+    - Server: /data/USER/mia_project
+    - Local: ./  (current directory)
+    """
+    # More specific check for the server environment
+    is_server = os.path.exists('/data') and os.name != 'nt'  # 'nt' means Windows
+    
+    if is_server:
+        # We're on the server
+        user = os.getenv('USER')
+        return f"/data/{user}/mia_project"
+    else:
+        # We're on local development - use current directory
+        return os.path.abspath(os.path.dirname(__file__)) + "/.."
+
+# Directory setup
+BASE_DIR = get_base_dir()
+DATA_DIR = os.path.join(BASE_DIR, "data") 
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 
 # Create necessary directories
@@ -33,6 +59,17 @@ HEIGHT = 32
 CHANNELS = 3
 ATTACK_TEST_DATASET_SIZE = 2500
 
+# Configure GPU and mixed precision
+def configure_gpu(use_gpu):
+    if not use_gpu:
+        print("Disabling GPU...")
+        tf.config.set_visible_devices([], 'GPU')
+    else:
+        print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+
+# Use larger batch sizes for GPU training
+DEFAULT_BATCH_SIZE = 32
+GPU_BATCH_SIZE = 256
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer(
@@ -124,17 +161,13 @@ def target_model_fn():
 
 
 def attack_model_fn():
-    """Attack model that takes target model predictions and predicts membership.
-    Following the original paper, this attack model is specific to the class of the input.
-    Architecture: Single hidden layer (64 units) with ReLU activation and softmax output.
-    """
-    model = tf.keras.models.Sequential()
-
-    # Single hidden layer with 64 units and ReLU activation
-    model.add(layers.Dense(64, activation="relu", input_shape=(NUM_CLASSES,)))
-
-    # Output layer with softmax activation
-    model.add(layers.Dense(2, activation="softmax"))
+    """Attack model that takes target model predictions and predicts membership."""
+    model = tf.keras.models.Sequential([
+        # Specify input shape explicitly
+        tf.keras.layers.Input(shape=(NUM_CLASSES,)),
+        tf.keras.layers.Dense(64, activation="relu"),
+        tf.keras.layers.Dense(2, activation="softmax")
+    ])
 
     model.compile(
         optimizer="adam",
@@ -144,80 +177,97 @@ def attack_model_fn():
     return model
 
 
+def print_progress(message, verbose=True):
+    """Print progress messages in a consistent format."""
+    if verbose:
+        print(f"\n{message}")
+
+
 def demo(argv):
     del argv  # Unused.
 
     # Define experiment parameters; override if in test mode.
     if FLAGS.test_mode:
-        print("Test mode enabled: Running minimal experiment.")
-        dataset_sizes = [100]          # Very small target training size
+        print_progress("Test mode enabled: Running minimal experiment.")
+        dataset_sizes = [250]          # Use a slightly larger target training size to avoid boundary issues
         runs_per_size = 1              # Just one run per dataset size
         target_epochs = 2              # Only run 2 epochs max
         attack_epochs = 2
         num_shadows = 2              # Use 2 shadow models
+        batch_size = DEFAULT_BATCH_SIZE
+        attack_test_size = 50        # Smaller test size for attack evaluation
+        configure_gpu(False)  # Disable GPU for test mode
     else:
-        dataset_sizes = [2500, 5000, 10000, 15000]
-        runs_per_size = 10
-        target_epochs = FLAGS.target_epochs
-        attack_epochs = FLAGS.attack_epochs
-        num_shadows = FLAGS.num_shadows
+        dataset_sizes = [2500, 5000]  # Just 2 sizes
+        runs_per_size = 5            # 5 runs each
+        target_epochs = 50           # 50 epochs
+        attack_epochs = 50           # 50 epochs
+        num_shadows = 20             # 20 shadow models
+        batch_size = GPU_BATCH_SIZE
+        attack_test_size = ATTACK_TEST_DATASET_SIZE
+        configure_gpu(True)  # Enable GPU for full experiment
 
-    # Define early stopping callback
-    early_stopping = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss',
-        patience=5,
-        restore_best_weights=True
-    )
+    # Initialize timing variables after parameters are set
+    start_time = time.time()
+    completed_runs = 0
+    total_runs = len(dataset_sizes) * runs_per_size
 
-    # Initialize list to collect results
-    results = []
+    # Load previous results if they exist
+    csv_file = os.path.join(RESULTS_DIR, "membership_inference_attack_results.csv")
+    existing_results = []
+    if os.path.exists(csv_file):
+        with open(csv_file, 'r') as f:
+            reader = csv.DictReader(f)
+            existing_results = list(reader)
+            
+    # Convert existing results to set of (size, run) tuples for easy lookup
+    completed_experiments = {(int(r['dataset_size']), int(r['run'])) 
+                           for r in existing_results}
+    
+    results = existing_results
 
-    # Set a base random seed for reproducibility
-    base_seed = 42
-
-    # Loop over each dataset size
     for size in dataset_sizes:
-        print(f"\n=== Running experiments for target training size: {size} ===")
-        
-        # Set shadow dataset size equal to target model training size
-        shadow_dataset_size = size
-        
         for run in range(1, runs_per_size + 1):
-            print(f"\n--- Run {run}/{runs_per_size} for size {size} ---")
-
+            run_start = time.time()
+            
+            # Skip if this experiment was already done
+            if (size, run) in completed_experiments:
+                print_progress(f"Skipping completed experiment: size={size}, run={run}")
+                continue
+                
+            print_progress(f"Running experiment: size={size}, run={run}")
             # Set seed for reproducibility per run
-            seed = base_seed + run
+            seed = 42 + run
             np.random.seed(seed)
             tf.random.set_seed(seed)
 
             # Get split data for current run
             (X_train, y_train), (X_test, y_test), (X_shadow, y_shadow) = get_data(size)
 
-            # Train the target model
-            print("Training the target model...")
+            # Train the target model with batch size
+            print_progress("Training the target model...")
             target_model = target_model_fn()
             target_model.fit(
                 X_train, y_train,
+                batch_size=batch_size,
                 epochs=target_epochs,
-                validation_data=(X_test, y_test),
-                callbacks=[early_stopping],
                 verbose=0
             )
 
-            # Train the shadow models with matching dataset size
+            # Train shadow models with batch size
             smb = ShadowModelBundle(
                 model_fn=target_model_fn,
                 shadow_dataset_size=size,
                 num_models=num_shadows,
             )
 
-            print("Training the shadow models...")
+            print_progress("Training the shadow models...")
             X_attack, y_attack = smb.fit_transform(
                 X_shadow,
                 y_shadow,
                 fit_kwargs=dict(
+                    batch_size=batch_size,
                     epochs=target_epochs,
-                    callbacks=[early_stopping],
                     verbose=0
                 ),
             )
@@ -225,20 +275,20 @@ def demo(argv):
             # Initialize the attack model bundle (one per class)
             amb = AttackModelBundle(attack_model_fn, num_classes=NUM_CLASSES)
 
-            # Fit the attack models
-            print("Training the attack models...")
+            # Train attack models with batch size
+            print_progress("Training the attack models...")
             amb.fit(
                 X_attack, y_attack,
                 fit_kwargs=dict(
+                    batch_size=batch_size,
                     epochs=attack_epochs,
-                    callbacks=[early_stopping],
                     verbose=0
                 )
             )
 
             # Prepare attack test data
-            data_in = X_train[:ATTACK_TEST_DATASET_SIZE], y_train[:ATTACK_TEST_DATASET_SIZE]
-            data_out = X_test[:ATTACK_TEST_DATASET_SIZE], y_test[:ATTACK_TEST_DATASET_SIZE]
+            data_in = X_train[:attack_test_size], y_train[:attack_test_size]
+            data_out = X_test[:attack_test_size], y_test[:attack_test_size]
 
             attack_test_data, real_membership_labels = prepare_attack_data(
                 target_model, data_in, data_out
@@ -250,30 +300,91 @@ def demo(argv):
             # Since real_membership_labels are one-hot encoded, convert them to class labels
             real_labels = np.argmax(real_membership_labels, axis=1)
 
-            # Compute metrics
+            # Compute overall metrics
             precision = precision_score(real_labels, attack_guesses, average='binary')
             recall = recall_score(real_labels, attack_guesses, average='binary')
             accuracy = accuracy_score(real_labels, attack_guesses)
 
-            print(f"Run {run} - Precision: {precision:.4f}, Recall: {recall:.4f}, Accuracy: {accuracy:.4f}")
+            # Compute per-class metrics
+            # Get the true class for each example (from the attack test data)
+            true_classes = np.argmax(attack_test_data[:, NUM_CLASSES:], axis=1)
+            
+            per_class_metrics = {}
+            for class_idx in range(NUM_CLASSES):
+                # Get indices for this class
+                class_mask = (true_classes == class_idx)
+                if not any(class_mask):
+                    continue
+                    
+                # Calculate metrics for this class
+                class_precision = precision_score(
+                    real_labels[class_mask], 
+                    attack_guesses[class_mask], 
+                    average='binary'
+                )
+                class_recall = recall_score(
+                    real_labels[class_mask], 
+                    attack_guesses[class_mask], 
+                    average='binary'
+                )
+                class_accuracy = accuracy_score(
+                    real_labels[class_mask], 
+                    attack_guesses[class_mask]
+                )
+                
+                per_class_metrics[class_idx] = {
+                    'precision': class_precision,
+                    'recall': class_recall,
+                    'accuracy': class_accuracy
+                }
 
-            # Append the results
-            results.append({
+            print(f"Run {run} - Overall Metrics - Precision: {precision:.4f}, Recall: {recall:.4f}, Accuracy: {accuracy:.4f}")
+            for class_idx, metrics in per_class_metrics.items():
+                print(f"Class {class_idx} - Precision: {metrics['precision']:.4f}, "
+                      f"Recall: {metrics['recall']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
+
+            # Append the results with per-class metrics
+            result_row = {
                 "dataset_size": size,
                 "run": run,
-                "precision": precision,
-                "recall": recall,
-                "accuracy": accuracy
-            })
+                "overall_precision": precision,
+                "overall_recall": recall,
+                "overall_accuracy": accuracy
+            }
+            
+            # Add per-class metrics to the result row
+            for class_idx, metrics in per_class_metrics.items():
+                result_row.update({
+                    f"class_{class_idx}_precision": metrics['precision'],
+                    f"class_{class_idx}_recall": metrics['recall'],
+                    f"class_{class_idx}_accuracy": metrics['accuracy']
+                })
+            
+            results.append(result_row)
 
-    # Save the results to a CSV file
-    csv_file = os.path.join(RESULTS_DIR, "membership_inference_attack_results.csv")
-    
-    with open(csv_file, mode='w', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=["dataset_size", "run", "precision", "recall", "accuracy"])
-        writer.writeheader()
-        for row in results:
-            writer.writerow(row)
+            # Save results after each run
+            with open(csv_file, mode='w', newline='') as file:
+                # Get all possible field names (some classes might be missing in some runs)
+                fieldnames = ["dataset_size", "run", "overall_precision", "overall_recall", "overall_accuracy"]
+                for class_idx in range(NUM_CLASSES):
+                    fieldnames.extend([
+                        f"class_{class_idx}_precision",
+                        f"class_{class_idx}_recall",
+                        f"class_{class_idx}_accuracy"
+                    ])
+                
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in results:
+                    writer.writerow(row)
+
+            completed_runs += 1
+            run_time = time.time() - run_start
+            remaining_runs = total_runs - completed_runs
+            est_remaining_time = run_time * remaining_runs / 60  # minutes
+            
+            print_progress(f"Completed {completed_runs}/{total_runs} runs. "
+                         f"Estimated time remaining: {est_remaining_time:.1f} minutes")
 
     print(f"\nExperiment results saved to '{csv_file}'.")
 
