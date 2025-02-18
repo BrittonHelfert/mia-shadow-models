@@ -3,6 +3,29 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Project-specific
+data/
+results/
+
+# Virtual environment
+venv/
+env/
+.env/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Keras
+.keras/
+
+# Logs
+*.log
+
+# Local development settings
+.env
+.envrc
+
 # C extensions
 *.so
 
@@ -57,11 +80,6 @@ target/
 
 # pyenv
 .python-version
-
-# virtualenv
-venv/
-ENV/
-.envrc
 
 # Spyder project settings
 .spyderproject

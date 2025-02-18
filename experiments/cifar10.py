@@ -14,6 +14,18 @@ from mia.estimators import ShadowModelBundle, AttackModelBundle, prepare_attack_
 
 from sklearn.metrics import precision_score, recall_score, accuracy_score
 
+# Add these near the top of the file, after imports
+USER = os.getenv('USER')
+BASE_DIR = f"/data/{USER}/mia_project"
+DATA_DIR = os.path.join(BASE_DIR, "data")
+RESULTS_DIR = os.path.join(BASE_DIR, "results")
+
+# Create necessary directories
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# Set Keras data directory
+os.environ['KERAS_HOME'] = DATA_DIR
 
 NUM_CLASSES = 10
 WIDTH = 32
@@ -28,6 +40,7 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer("attack_epochs", 100, "Max number of epochs to train attack models.")
 flags.DEFINE_integer("num_shadows", 100, "Number of shadow models to train.")
+flags.DEFINE_bool("test_mode", False, "Run a minimal experiment for testing purposes.")
 
 
 def get_data(dataset_size):
@@ -134,10 +147,21 @@ def attack_model_fn():
 def demo(argv):
     del argv  # Unused.
 
-    # Define dataset sizes and callbacks
-    dataset_sizes = [2500, 5000, 10000, 15000]
-    runs_per_size = 10
-    
+    # Define experiment parameters; override if in test mode.
+    if FLAGS.test_mode:
+        print("Test mode enabled: Running minimal experiment.")
+        dataset_sizes = [100]          # Very small target training size
+        runs_per_size = 1              # Just one run per dataset size
+        target_epochs = 2              # Only run 2 epochs max
+        attack_epochs = 2
+        num_shadows = 2              # Use 2 shadow models
+    else:
+        dataset_sizes = [2500, 5000, 10000, 15000]
+        runs_per_size = 10
+        target_epochs = FLAGS.target_epochs
+        attack_epochs = FLAGS.attack_epochs
+        num_shadows = FLAGS.num_shadows
+
     # Define early stopping callback
     early_stopping = tf.keras.callbacks.EarlyStopping(
         monitor='val_loss',
@@ -174,7 +198,7 @@ def demo(argv):
             target_model = target_model_fn()
             target_model.fit(
                 X_train, y_train,
-                epochs=FLAGS.target_epochs,
+                epochs=target_epochs,
                 validation_data=(X_test, y_test),
                 callbacks=[early_stopping],
                 verbose=0
@@ -183,8 +207,8 @@ def demo(argv):
             # Train the shadow models with matching dataset size
             smb = ShadowModelBundle(
                 model_fn=target_model_fn,
-                shadow_dataset_size=shadow_dataset_size,
-                num_models=FLAGS.num_shadows,
+                shadow_dataset_size=size,
+                num_models=num_shadows,
             )
 
             print("Training the shadow models...")
@@ -192,7 +216,7 @@ def demo(argv):
                 X_shadow,
                 y_shadow,
                 fit_kwargs=dict(
-                    epochs=FLAGS.target_epochs,
+                    epochs=target_epochs,
                     callbacks=[early_stopping],
                     verbose=0
                 ),
@@ -206,7 +230,7 @@ def demo(argv):
             amb.fit(
                 X_attack, y_attack,
                 fit_kwargs=dict(
-                    epochs=FLAGS.attack_epochs,
+                    epochs=attack_epochs,
                     callbacks=[early_stopping],
                     verbose=0
                 )
@@ -243,9 +267,7 @@ def demo(argv):
             })
 
     # Save the results to a CSV file
-    results_dir = "results"
-    os.makedirs(results_dir, exist_ok=True)
-    csv_file = os.path.join(results_dir, "membership_inference_attack_results.csv")
+    csv_file = os.path.join(RESULTS_DIR, "membership_inference_attack_results.csv")
     
     with open(csv_file, mode='w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=["dataset_size", "run", "precision", "recall", "accuracy"])
